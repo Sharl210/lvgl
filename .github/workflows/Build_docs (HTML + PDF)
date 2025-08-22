@@ -1,0 +1,153 @@
+name: Build docs (HTML + PDF)
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - 'release/*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  EM_VERSION: 2.0.4
+  EM_CACHE_FOLDER: 'emsdk-cache'
+
+jobs:
+  build-and-deploy:
+    # Removed the original repository-only guard so this can run in forks as well.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ${{ env.pythonLocation }}/bin/*
+            ${{ env.pythonLocation }}/include
+            ${{ env.pythonLocation }}/lib/python*/site-packages/*
+            !${{ env.pythonLocation }}/bin/pip*
+            !${{ env.pythonLocation }}/lib/python*/site-packages/pip*
+            !${{ env.pythonLocation }}/lib/python*/site-packages/setuptools*
+          key: ${{ env.pythonLocation }}-${{ hashFiles('docs/requirements.txt') }}
+
+      - name: Install Doxygen and LaTeX dependencies
+        run: |
+          sudo apt-get update
+          # Install doxygen + minimal LaTeX toolchain used by this repo (xetex backend)
+          sudo apt-get install -y doxygen texlive-xetex texlive-binaries texlive-lang-english latexmk fonts-freefont-otf make
+
+      - name: Install requirements
+        run: |
+          pip install -r docs/requirements.txt
+
+      - name: Setup Emscripten cache
+        id: cache-system-libraries
+        uses: actions/cache@v4
+        with:
+          path: ${{env.EM_CACHE_FOLDER}}
+          key: ${{env.EM_VERSION}}-${{ runner.os }}
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{env.EM_VERSION}}
+          actions-cache-folder: ${{env.EM_CACHE_FOLDER}}
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
+
+      - name: Build examples (with cache)
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            REPO_URL="${{ github.event.pull_request.head.repo.clone_url }}"
+            COMMIT_REF="${{ github.event.pull_request.head.sha }}"
+          else
+            REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+            COMMIT_REF="${{ github.sha }}"
+          fi
+          ./scripts/build_html_examples.sh "$REPO_URL" "$COMMIT_REF"
+
+      - name: Build docs (HTML)
+        run: docs/build.py html
+
+      - name: Remove .doctrees
+        run: rm -rf docs/build/html/.doctrees
+
+      - name: Retrieve version
+        id: version
+        run: |
+          echo "VERSION_NAME=$(scripts/find_version.sh)" >> $GITHUB_OUTPUT
+
+      # --- Build PDF: run only on push to master/release/* or manual dispatch ---
+      - name: Build PDF (Sphinx -> LaTeX -> PDF)
+        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/heads/release/'))) }}
+        working-directory: docs
+        run: |
+          set -euo pipefail
+          # Prefer Makefile if present
+          if [ -f Makefile ]; then
+            make latexpdf
+          else
+            # Generic Sphinx -> LaTeX -> PDF flow
+            sphinx-build -b latex . _build/latex
+            # latexmk will compile the produced .tex into PDF; change dir to the latex build
+            ls -la _build/latex
+            # Find the main .tex (usually the first .tex)
+            TEXFILE=$(ls _build/latex/*.tex | head -n 1)
+            if [ -z "$TEXFILE" ]; then
+              echo "No .tex files found in docs/_build/latex. PDF build cannot continue."
+              exit 1
+            fi
+            # Run latexmk on the main tex file
+            latexmk -pdf -silent -cd "$TEXFILE"
+          fi
+
+      - name: Upload docs PDF artifact
+        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/heads/release/'))) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lvgl-docs-pdf-${{ steps.version.outputs.VERSION_NAME || github.sha }}
+          path: |
+            docs/_build/latex/*.pdf
+          if-no-files-found: warn
+
+      - name: Deploy to subfolder
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        uses: JamesIves/github-pages-deploy-action@v4.7.3
+        with:
+          token: ${{ secrets.LVGL_BOT_TOKEN }}
+          repository-name: lvgl/docs
+          branch: gh-pages
+          folder: docs/build/html
+          target-folder: ${{ steps.version.outputs.VERSION_NAME }}
+          git-config-name: lvgl-bot
+          git-config-email: lvgl-bot@users.noreply.github.com
+          single-commit: true
+
+      - name: Deploy to master
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        uses: JamesIves/github-pages-deploy-action@v4.7.3
+        with:
+          token: ${{ secrets.LVGL_BOT_TOKEN }}
+          repository-name: lvgl/docs
+          branch: gh-pages
+          folder: docs/build/html
+          target-folder: master
+          git-config-name: lvgl-bot
+          git-config-email: lvgl-bot@users.noreply.github.com
+          commit: true
