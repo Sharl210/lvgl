@@ -1,73 +1,184 @@
-name: Build LVGL Docs PDF
+name: Build LVGL 9.4 PDF Documentation
 
 on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'LVGL branch/tag (e.g. v9.4, v9.3, master)'
-        required: true
-        default: 'v9.4'
+  workflow_dispatch:  # 手动触发
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * 0'  # 每周日凌晨2点自动构建
 
 jobs:
   build-pdf:
     runs-on: ubuntu-latest
-
+    
     steps:
-      - name: Checkout LVGL
-        uses: actions/checkout@v4
-        with:
-          repository: lvgl/lvgl
-          ref: ${{ inputs.ref }}
-          submodules: recursive
+    - name: Checkout LVGL Repository
+      uses: actions/checkout@v4
+      with:
+        repository: 'lvgl/lvgl'
+        ref: 'v9.4.0'  # 或者使用 'release/v9.4' 分支
+        fetch-depth: 1
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install LaTeX and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          texlive-latex-recommended \
+          texlive-latex-extra \
+          texlive-fonts-recommended \
+          texlive-fonts-extra \
+          texlive-xetex \
+          texlive-luatex \
+          texlive-bibtex-extra \
+          latexmk \
+          xindy
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install \
+          sphinx \
+          sphinx-rtd-theme \
+          sphinx-copybutton \
+          breathe \
+          exhale \
+          myst-parser \
+          sphinx-design \
+          sphinx-tabs \
+          furo
+    
+    - name: Check docs directory structure
+      run: |
+        echo "=== Repository structure ==="
+        ls -la
+        echo "=== Docs directory ==="
+        if [ -d "docs" ]; then
+          ls -la docs/
+          find docs/ -name "*.py" -o -name "conf.py" -o -name "Makefile" | head -20
+        else
+          echo "No docs directory found"
+          find . -name "*.rst" -o -name "conf.py" | head -20
+        fi
+    
+    - name: Build HTML documentation first (for debugging)
+      run: |
+        cd docs
+        if [ -f "Makefile" ]; then
+          make html
+        elif [ -f "conf.py" ]; then
+          sphinx-build -b html . _build/html
+        else
+          echo "No Makefile or conf.py found, trying alternative locations..."
+          cd ..
+          find . -name "conf.py" -exec dirname {} \; | head -1 | xargs -I {} sh -c 'cd {} && sphinx-build -b html . _build/html'
+        fi
+    
+    - name: Build PDF documentation
+      run: |
+        cd docs
+        if [ -f "Makefile" ]; then
+          make latexpdf
+        elif [ -f "conf.py" ]; then
+          sphinx-build -b latex . _build/latex
+          cd _build/latex
+          latexmk -pdf -f -interaction=nonstopmode *.tex || pdflatex -interaction=nonstopmode *.tex
+        else
+          echo "Trying alternative build method..."
+          cd ..
+          DOC_DIR=$(find . -name "conf.py" -exec dirname {} \; | head -1)
+          cd "$DOC_DIR"
+          sphinx-build -b latex . _build/latex
+          cd _build/latex
+          latexmk -pdf -f -interaction=nonstopmode *.tex || pdflatex -interaction=nonstopmode *.tex
+        fi
+    
+    - name: Find and rename PDF
+      run: |
+        echo "=== Looking for generated PDF files ==="
+        find . -name "*.pdf" -type f
+        
+        # Find the main PDF file
+        PDF_FILE=$(find . -name "*.pdf" -path "*/_build/latex/*" | head -1)
+        
+        if [ -n "$PDF_FILE" ]; then
+          echo "Found PDF: $PDF_FILE"
+          cp "$PDF_FILE" "./LVGL-9.4-Documentation.pdf"
+          ls -la "./LVGL-9.4-Documentation.pdf"
+        else
+          echo "No PDF found, checking build logs..."
+          find . -name "*.log" -path "*/_build/latex/*" -exec cat {} \;
+          exit 1
+        fi
+    
+    - name: Upload PDF as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: LVGL-9.4-PDF-Documentation
+        path: LVGL-9.4-Documentation.pdf
+        retention-days: 30
+    
+    - name: Create Release (optional)
+      if: github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: "lvgl-9.4-docs-${{ github.run_number }}"
+        name: "LVGL 9.4 Documentation PDF"
+        body: |
+          LVGL 9.4 Documentation in PDF format
+          
+          Generated on: ${{ github.event.head_commit.timestamp }}
+          Commit: ${{ github.sha }}
+        files: LVGL-9.4-Documentation.pdf
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    # Fallback: Alternative build method if main method fails
+    - name: Alternative build method (if needed)
+      if: failure()
+      run: |
+        echo "=== Trying alternative approach ==="
+        
+        # Method 1: Use pandoc if available
+        sudo apt-get install -y pandoc
+        
+        # Find all RST files and convert
+        find . -name "*.rst" -path "*/docs/*" | head -20 | while read rst_file; do
+          echo "Found RST: $rst_file"
+        done
+        
+        # Method 2: Try with different Sphinx themes
+        cd docs || cd $(find . -name "conf.py" -exec dirname {} \; | head -1)
+        
+        # Modify conf.py to use simpler theme for PDF
+        if [ -f "conf.py" ]; then
+          cp conf.py conf.py.backup
+          cat >> conf.py << EOF
 
-      # NOTE:
-      # - texlive-full is large and slow but painless.
-      # - If it times out, switch to the "slim toolchain" below and add missing packages as errors indicate.
-      - name: Install LaTeX toolchain (texlive-full)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y make latexmk texlive-full
+# PDF-specific settings
+latex_elements = {
+    'papersize': 'a4paper',
+    'pointsize': '10pt',
+    'preamble': r'''
+\usepackage{xeCJK}
+\setCJKmainfont{DejaVu Sans}
+''',
+}
 
-      # --- Slim toolchain alternative (commented out) ---
-      # - name: Install LaTeX toolchain (slim)
-      #   run: |
-      #     sudo apt-get update
-      #     sudo apt-get install -y make latexmk \
-      #       texlive-latex-extra texlive-fonts-recommended texlive-lang-cjk
-      # ---------------------------------------------------
-
-      - name: Install Python deps
-        working-directory: docs
-        run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            # Fallback common deps; adjust if your docs use extra Sphinx extensions
-            pip install sphinx sphinx-rtd-theme
-          fi
-
-      - name: Build PDF (Sphinx LaTeX)
-        working-directory: docs
-        run: |
-          # Try Makefile first
-          if [ -f Makefile ]; then
-            make latexpdf
-          else
-            # Generic fallback
-            sphinx-build -b latex . _build/latex
-            latexmk -pdf -silent -cd _build/latex/*.tex
-          fi
-
-      - name: Upload PDF artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lvgl-docs-pdf-${{ inputs.ref }}
-          path: |
-            docs/_build/latex/*.pdf
-          if-no-files-found: error
+latex_documents = [
+    ('index', 'LVGL.tex', 'LVGL Documentation', 'LVGL Team', 'manual'),
+]
+EOF
+        fi
+        
+        sphinx-build -b latex . _build/latex -v
+        cd _build/latex
+        ls -la
+        pdflatex -interaction=nonstopmode LVGL.tex || echo "PDF build failed, but continuing..."
+        ls -la *.pdf || echo "No PDF generated"
