@@ -1,184 +1,77 @@
-name: Build docs (HTML + PDF + single MD)
+# .github/workflows/build-docs.yml
 
+name: Build Documentation
+
+# 触发条件：当推送到 master 分支或有人向 master 分支发起 Pull Request 时运行
 on:
-  pull_request:
   push:
-    branches:
-      - master
-      - 'release/*'
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.ref }}-${{ github.workflow }}
-  cancel-in-progress: true
-
-env:
-  EM_VERSION: 2.0.4
-  EM_CACHE_FOLDER: 'emsdk-cache'
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
 
 jobs:
-  build-and-deploy:
-    runs-on: ubuntu-24.04
+  build-documentation:
+    # 使用最新的 Ubuntu 运行环境
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      # 第一步：检出仓库代码
+      # 拉取你的仓库代码到 Actions 的运行环境中
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      # 第二步：安装 Pandoc
+      # Pandoc 是一个强大的文档转换工具，可以处理多种格式
+      - name: Set up Pandoc
+        uses: r-lib/actions/setup-pandoc@v2
         with:
-          persist-credentials: false
-          fetch-depth: 0
+          pandoc-version: 'latest' # 使用最新版本的 Pandoc
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      # 第三步：安装 LaTeX (用于生成 PDF)
+      # Pandoc 需要一个 LaTeX 引擎来将 Markdown 转换为 PDF
+      - name: Install LaTeX distribution for PDF generation
+        run: sudo apt-get update && sudo apt-get install -y texlive-xetex texlive-fonts-recommended
 
-      - name: Cache Python packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ${{ env.pythonLocation }}/bin/*
-            ${{ env.pythonLocation }}/include
-            ${{ env.pythonLocation }}/lib/python*/site-packages/*
-            !${{ env.pythonLocation }}/bin/pip*
-            !${{ env.pythonLocation }}/lib/python*/site-packages/pip*
-            !${{ env.pythonLocation }}/lib/python*/site-packages/setuptools*
-          key: ${{ env.pythonLocation }}-${{ hashFiles('docs/requirements.txt') }}
+      # 第四步：创建用于存放输出文件的目录
+      - name: Create output directory
+        run: mkdir -p built_docs
 
-      - name: Install Doxygen, LaTeX and Pandoc dependencies
+      # 第五步：合并所有 Markdown 文件
+      # 假设你的文档源文件都在 'docs' 目录下
+      # 这个命令会查找 'docs' 目录下的所有 .md 文件，并按字母顺序将它们合并成一个大的 Markdown 文件
+      # 注意：你可能需要根据文档的实际结构和期望的章节顺序来调整这个命令
+      - name: Concatenate Markdown files
         run: |
-          sudo apt-get update
-          # doxygen + LaTeX (xetex) + pandoc + latexmk + make
-          sudo apt-get install -y doxygen texlive-xetex texlive-binaries texlive-lang-english latexmk fonts-freefont-otf make pandoc
+          echo "# LVGL Documentation" > built_docs/full_documentation.md
+          find docs -name "*.md" -print0 | sort -z | xargs -0 -I {} sh -c 'cat {}; echo -e "\\n\\n"' >> built_docs/full_documentation.md
 
-      - name: Install requirements
-        run: |
-          pip install -r docs/requirements.txt
+      # 第六步：使用 Pandoc 构建 HTML 文件
+      # --standalone (-s): 生成一个包含完整头尾的独立 HTML 文件
+      # --toc: 自动生成目录
+      # --metadata title="...": 设置文档标题
+      - name: Build HTML
+        run: >
+          pandoc built_docs/full_documentation.md 
+          -o built_docs/documentation.html 
+          --standalone 
+          --toc 
+          --metadata title="LVGL Documentation"
 
-      - name: Setup Emscripten cache
-        id: cache-system-libraries
-        uses: actions/cache@v4
-        with:
-          path: ${{env.EM_CACHE_FOLDER}}
-          key: ${{env.EM_VERSION}}-${{ runner.os }}
+      # 第七步：使用 Pandoc 构建 PDF 文件
+      # --pdf-engine=xelatex: 使用 XeLaTeX 引擎，对中文字符等有更好的支持
+      - name: Build PDF
+        run: >
+          pandoc built_docs/full_documentation.md 
+          -o built_docs/documentation.pdf 
+          --pdf-engine=xelatex 
+          --toc 
+          --metadata title="LVGL Documentation"
 
-      - uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: ${{env.EM_VERSION}}
-          actions-cache-folder: ${{env.EM_CACHE_FOLDER}}
-
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1
-
-      - name: Build examples (with cache)
-        run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            REPO_URL="${{ github.event.pull_request.head.repo.clone_url }}"
-            COMMIT_REF="${{ github.event.pull_request.head.sha }}"
-          else
-            REPO_URL="${{ github.server_url }}/${{ github.repository }}"
-            COMMIT_REF="${{ github.sha }}"
-          fi
-          ./scripts/build_html_examples.sh "$REPO_URL" "$COMMIT_REF"
-
-      - name: Build docs (HTML)
-        run: docs/build.py html
-
-      - name: Remove .doctrees
-        run: rm -rf docs/build/html/.doctrees
-
-      - name: Retrieve version
-        id: version
-        run: |
-          echo "VERSION_NAME=$(scripts/find_version.sh)" >> $GITHUB_OUTPUT
-
-      # --- New: Build single HTML (singlehtml) and convert to a single Markdown file ---
-      - name: Build single HTML (singlehtml)
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/heads/release/'))) }}
-        working-directory: docs
-        run: |
-          set -euo pipefail
-          # Create a single HTML file containing the whole site
-          sphinx-build -b singlehtml . _build/singlehtml
-          echo "Single HTML built to docs/_build/singlehtml"
-
-      - name: Convert single HTML to single Markdown (pandoc)
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/heads/release/'))) }}
-        working-directory: docs
-        run: |
-          set -euo pipefail
-          HTML_FILE=_build/singlehtml/index.html
-          MD_OUT=_build/single-md/merged.md
-          mkdir -p $(dirname "$MD_OUT")
-          if [ ! -f "$HTML_FILE" ]; then
-            echo "Error: $HTML_FILE not found. Aborting single-md conversion."
-            ls -la _build || true
-            exit 1
-          fi
-          # Convert single HTML to GitHub-flavored Markdown. Adjust pandoc flags as needed.
-          pandoc -f html -t gfm --wrap=none -o "$MD_OUT" "$HTML_FILE"
-          echo "Generated merged markdown at docs/$MD_OUT"
-          # show small preview
-          head -n 80 "$MD_OUT" || true
-
-      - name: Upload merged MD artifact
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/heads/release/'))) }}
+      # 第八步：上传构建产物
+      # 将 'built_docs' 目录下的所有文件打包成一个名为 'documentation-artifacts' 的产物
+      # 你可以在 Action 运行结束后，在页面上手动下载这个产物
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lvgl-docs-merged-md-${{ steps.version.outputs.VERSION_NAME || github.sha }}
-          path: docs/_build/single-md/merged.md
-          if-no-files-found: warn
-
-      # --- Build PDF: run only on push to master/release/* or manual dispatch ---
-      - name: Build PDF (Sphinx -> LaTeX -> PDF)
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/heads/release/'))) }}
-        working-directory: docs
-        run: |
-          set -euo pipefail
-          if [ -f Makefile ]; then
-            make latexpdf
-          else
-            sphinx-build -b latex . _build/latex
-            ls -la _build/latex
-            TEXFILE=$(ls _build/latex/*.tex | head -n 1)
-            if [ -z "$TEXFILE" ]; then
-              echo "No .tex files found in docs/_build/latex. PDF build cannot continue."
-              exit 1
-            fi
-            latexmk -pdf -silent -cd "$TEXFILE"
-          fi
-
-      - name: Upload docs PDF artifact
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/heads/release/'))) }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: lvgl-docs-pdf-${{ steps.version.outputs.VERSION_NAME || github.sha }}
-          path: |
-            docs/_build/latex/*.pdf
-          if-no-files-found: warn
-
-      - name: Deploy to subfolder
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-        uses: JamesIves/github-pages-deploy-action@v4.7.3
-        with:
-          token: ${{ secrets.LVGL_BOT_TOKEN }}
-          repository-name: lvgl/docs
-          branch: gh-pages
-          folder: docs/build/html
-          target-folder: ${{ steps.version.outputs.VERSION_NAME }}
-          git-config-name: lvgl-bot
-          git-config-email: lvgl-bot@users.noreply.github.com
-          single-commit: true
-
-      - name: Deploy to master
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-        uses: JamesIves/github-pages-deploy-action@v4.7.3
-        with:
-          token: ${{ secrets.LVGL_BOT_TOKEN }}
-          repository-name: lvgl/docs
-          branch: gh-pages
-          folder: docs/build/html
-          target-folder: master
-          git-config-name: lvgl-bot
-          git-config-email: lvgl-bot@users.noreply.github.com
-          commit: true
+          name: documentation-artifacts
+          path: built_docs/
